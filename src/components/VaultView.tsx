@@ -37,6 +37,8 @@ interface VaultViewProps {
   onOpenSentiment?: () => void;
 }
 
+const MAX_UPLOAD_SIZE_BYTES = 2.5 * 1024 * 1024;
+
 const ALL_MOODS: EmotionalMood[] = [
   'Raw Grief',
   'Quiet Peace',
@@ -94,10 +96,17 @@ export const VaultView: React.FC<VaultViewProps> = ({
   const addFilesToStaging = (newFiles: File[]) => {
     setUploadError(null);
     setUploadSuccess(null);
-    setStagedFiles((prev) => [...prev, ...newFiles]);
+    const acceptedFiles = newFiles.filter((file) => file.size <= MAX_UPLOAD_SIZE_BYTES);
+    const oversizedCount = newFiles.length - acceptedFiles.length;
+    if (oversizedCount > 0) {
+      setUploadError(`${oversizedCount} file${oversizedCount === 1 ? '' : 's'} exceed the 2.5 MB limit for online analysis and were not added.`);
+    }
+    if (acceptedFiles.length === 0) return;
+
+    setStagedFiles((prev) => [...prev, ...acceptedFiles]);
 
     // If first file is image, show preview
-    const firstImg = newFiles.find(f => f.type.startsWith('image/'));
+    const firstImg = acceptedFiles.find(f => f.type.startsWith('image/'));
     if (firstImg && !previewUrl) {
       const reader = new FileReader();
       reader.onload = (event) => {

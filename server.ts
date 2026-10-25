@@ -16,9 +16,77 @@ if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
   throw new Error('PORT must be an integer between 1 and 65535.');
 }
 
-// High limit for handling journal photos and document base64
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ limit: '50mb', extended: true }));
+app.set('trust proxy', 1);
+
+// Vercel Functions reject request bodies above 4.5 MB; leave headroom for platform overhead.
+app.use(express.json({ limit: '4mb' }));
+app.use(express.urlencoded({ limit: '4mb', extended: true }));
+
+type RateLimitBucket = { count: number; resetAt: number };
+// Best-effort per-instance throttle; use a shared store or edge firewall for a global quota.
+const geminiRateLimitBuckets = new Map<string, RateLimitBucket>();
+
+function geminiRateLimit(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const now = Date.now();
+  const clientAddress = req.ip || req.socket.remoteAddress || 'unknown';
+  const current = geminiRateLimitBuckets.get(clientAddress);
+  const bucket = !current || current.resetAt <= now
+    ? { count: 0, resetAt: now + 15 * 60 * 1000 }
+    : current;
+
+  if (bucket.count >= 60) {
+    res.set('Retry-After', String(Math.max(1, Math.ceil((bucket.resetAt - now) / 1000))));
+    return res.status(429).json({ error: 'Too many AI requests. Please wait a few minutes and try again.' });
+  }
+
+  bucket.count += 1;
+  geminiRateLimitBuckets.set(clientAddress, bucket);
+  res.set('RateLimit-Limit', '60');
+  res.set('RateLimit-Remaining', String(60 - bucket.count));
+  res.set('RateLimit-Reset', String(Math.ceil(bucket.resetAt / 1000)));
+
+  if (geminiRateLimitBuckets.size > 5000) {
+    for (const [key, value] of geminiRateLimitBuckets) {
+      if (value.resetAt <= now) geminiRateLimitBuckets.delete(key);
+    }
+    while (geminiRateLimitBuckets.size > 5000) {
+      const oldestKey = geminiRateLimitBuckets.keys().next().value;
+      if (!oldestKey) break;
+      geminiRateLimitBuckets.delete(oldestKey);
+    }
+  }
+
+  next();
+}
+
+function requireSameOrigin(req: express.Request, res: express.Response, next: express.NextFunction) {
+  const origin = req.get('origin');
+  const host = req.get('host');
+  if (!origin || !host) {
+    return res.status(403).json({ error: 'AI requests must come from this website.' });
+  }
+
+  try {
+    const parsedOrigin = new URL(origin);
+    if (parsedOrigin.host !== host || (process.env.VERCEL && parsedOrigin.protocol !== 'https:')) {
+      return res.status(403).json({ error: 'AI requests must come from this website.' });
+    }
+  } catch {
+    return res.status(403).json({ error: 'AI requests must come from this website.' });
+  }
+
+  res.set('Cache-Control', 'no-store');
+  next();
+}
+
+function requireGeminiKey(_req: express.Request, res: express.Response, next: express.NextFunction) {
+  if (!process.env.GEMINI_API_KEY?.trim()) {
+    return res.status(503).json({ error: 'AI chat is not configured on this deployment yet.' });
+  }
+  next();
+}
+
+app.use('/api/gemini', requireSameOrigin, geminiRateLimit, requireGeminiKey);
 
 // System Governance State
 let systemGovernanceState: {
@@ -35,10 +103,10 @@ function getAi(): GoogleGenAI {
   if (!aiClient) {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
-      console.warn('GEMINI_API_KEY is not set in environment. Gemini features will require key configuration.');
+      throw new Error('GEMINI_API_KEY is not configured.');
     }
     aiClient = new GoogleGenAI({
-      apiKey: apiKey || '',
+      apiKey,
       httpOptions: {
         headers: {
           'User-Agent': 'aistudio-build',
@@ -53,7 +121,6 @@ function getAi(): GoogleGenAI {
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
-    hasKey: Boolean(process.env.GEMINI_API_KEY),
     systemState: systemGovernanceState.state,
     timestamp: new Date().toISOString(),
   });
@@ -106,6 +173,15 @@ app.post('/api/gemini/analyze-artifact', async (req, res) => {
     }
 
     const { fileDataUrl, mimeType, rawText, fileName, categoryHint } = req.body;
+    if (fileDataUrl !== undefined && typeof fileDataUrl !== 'string') {
+      return res.status(400).json({ error: 'The uploaded file data is invalid.' });
+    }
+    if (rawText !== undefined && typeof rawText !== 'string') {
+      return res.status(400).json({ error: 'The submitted text is invalid.' });
+    }
+    if (typeof rawText === 'string' && rawText.length > 100_000) {
+      return res.status(413).json({ error: 'Text uploads must be 100,000 characters or less.' });
+    }
     const ai = getAi();
 
     const systemPrompt = `You are a high-fidelity archive analyst for "Lacey's Soul Replica & Memory Vault".
@@ -219,7 +295,7 @@ Return strictly JSON matching the required schema.`;
   } catch (error: any) {
     console.error('Error analyzing artifact:', error);
     res.status(500).json({
-      error: error.message || 'Failed to analyze artifact with Gemini',
+      error: 'The artifact could not be analyzed right now. Please try again later.',
     });
   }
 });
@@ -274,6 +350,17 @@ app.post('/api/auth/verify-access', (req, res) => {
 // Chat / Simulation Engine with Lacey's Evidence-Grounded Persona
 app.post('/api/gemini/chat', async (req, res) => {
   try {
+    const incomingMessages = req.body?.messages;
+    if (!Array.isArray(incomingMessages) || incomingMessages.length > 80) {
+      return res.status(400).json({ error: 'The conversation must contain no more than 80 messages.' });
+    }
+    if (incomingMessages.some((message: any) => !message || typeof message.text !== 'string')) {
+      return res.status(400).json({ error: 'Each conversation message must contain text.' });
+    }
+    if (incomingMessages.reduce((total: number, message: any) => total + message.text.length, 0) > 100_000) {
+      return res.status(413).json({ error: 'The conversation is too long. Start a new chat and try again.' });
+    }
+
     // Check system governance
     if (systemGovernanceState.state === 'shutdown' || systemGovernanceState.state === 'paused') {
       return res.status(503).json({
@@ -615,7 +702,7 @@ ${isCounterfactual ? 'This is a PREDICTION / COUNTERFACTUAL query (e.g. "What wo
   } catch (error: any) {
     console.error('Error in persona chat:', error);
     res.status(500).json({
-      error: error.message || 'Failed to generate response',
+      error: 'The AI response could not be generated right now. Please try again later.',
     });
   }
 });
@@ -730,7 +817,7 @@ Draft this testament letter.`;
     res.json({ success: true, letter: response.text });
   } catch (error: any) {
     console.error('Error compiling testament:', error);
-    res.status(500).json({ error: error.message || 'Failed to compile testament' });
+    res.status(500).json({ error: 'The testament could not be generated right now. Please try again later.' });
   }
 });
 
@@ -742,7 +829,7 @@ async function start() {
       appType: 'spa',
     });
     app.use(vite.middlewares);
-  } else {
+  } else if (!process.env.VERCEL) {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
