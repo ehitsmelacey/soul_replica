@@ -1,0 +1,6 @@
+{
+  "name": "Soul Replica - Personal Perspective & Memory Vault",
+  "description": "An authentic AI replica that thinks and speaks with your perspective, trained on personal journals, raw writings from lowest lows, and art, to be there for friends when life is heavy and leave an eternal testament of love for your children.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
